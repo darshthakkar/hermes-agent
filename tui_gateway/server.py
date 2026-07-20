@@ -578,6 +578,22 @@ def _ensure_turn_lease(sid: str, session: dict) -> str | None:
     return None
 
 
+def _admit_turn_or_emit_limit(rid: str, sid: str, session: dict) -> bool:
+    """Synchronously reserve capacity before build, dispatch, or acknowledgement."""
+    limit_message = _ensure_turn_lease(sid, session)
+    if limit_message is None:
+        return True
+    _emit("message.start", sid)
+    _emit("error", sid, {"message": limit_message})
+    with session["history_lock"]:
+        session["running"] = False
+        session["last_active"] = time.time()
+        _clear_inflight_turn(session)
+    if not _drain_queued_prompt(rid, sid, session):
+        _schedule_idle_lease_release(sid, session)
+    return False
+
+
 def _transfer_active_session_slot(
     sid: str,
     session: dict,
@@ -899,16 +915,43 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
     )
 
 
-def _ws_session_is_orphaned(session: dict | None) -> bool:
-    """True if a WS session has no live transport and no in-flight turn.
+def _session_has_active_background_work(session: dict) -> bool:
+    """Whether explicit background processes still depend on this warm session."""
+    key = str(session.get("session_key") or "")
+    if not key:
+        return False
+    try:
+        from tools.process_registry import process_registry
 
-    After ``handle_ws`` detaches a disconnected client it points the session at
-    ``_detached_ws_transport``. A session left on that transport (and not
-    mid-turn) is genuinely orphaned and safe to reap.
-    """
+        return bool(process_registry.has_active_for_session(key))
+    except Exception:
+        # Lifecycle teardown is destructive; fail closed if process ownership
+        # cannot be inspected reliably.
+        logger.debug("Failed to inspect session background processes", exc_info=True)
+        return True
+
+
+def _session_has_protected_lifecycle_work(sid: str, session: dict) -> bool:
+    """Work that makes destructive orphan/TTL/LRU teardown unsafe."""
+    if (
+        session.get("running")
+        or session.get("queued_prompt")
+        or session.get("_post_turn_followups_pending")
+        or _session_pending_kind(sid)
+    ):
+        return True
+    ready = session.get("agent_ready")
+    if ready is not None and not ready.is_set() and not session.get("lazy"):
+        return True
+    return _session_has_active_background_work(session)
+
+
+def _ws_session_is_orphaned(session: dict | None) -> bool:
+    """True if a WS session has no live transport and no protected work."""
     if not session or session.get("_finalized"):
         return False
-    if session.get("running"):
+    sid = str(session.get("ui_session_id") or "")
+    if _session_has_protected_lifecycle_work(sid, session):
         return False
     return session.get("transport") is _detached_ws_transport
 
@@ -1025,12 +1068,7 @@ def _transport_is_dead(transport) -> bool:
 
 
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
-    if session.get("running") or _session_pending_kind(sid):
-        return False
-    ready = session.get("agent_ready")
-    # Lazy watch sessions (subagent spectator windows) never start a build,
-    # so their forever-unset agent_ready must not make them immortal.
-    if ready is not None and not ready.is_set() and not session.get("lazy"):
+    if _session_has_protected_lifecycle_work(sid, session):
         return False
     if not _transport_is_dead(session.get("transport")):
         return False
@@ -1077,6 +1115,26 @@ def _idle_lease_release_blocked(sid: str, session: dict) -> bool:
     return bool(ready is not None and not ready.is_set() and not session.get("lazy"))
 
 
+def _release_idle_active_session_lease_locked(session: dict, *, reason: str) -> bool:
+    """Release registry ownership before exposing an empty session lease slot.
+
+    The caller holds history_lock. Keeping that lock across registry release
+    prevents a new turn from observing ``active_session_lease=None`` while its
+    old registry entry still occupies the cap.
+    """
+    lease = session.get("active_session_lease")
+    if lease is None:
+        return False
+    try:
+        lease.release()
+    except Exception:
+        logger.debug("Failed to release %s active session lease", reason, exc_info=True)
+    finally:
+        if session.get("active_session_lease") is lease:
+            session.pop("active_session_lease", None)
+    return True
+
+
 def _schedule_idle_lease_release(sid: str, session: dict) -> None:
     """Release this turn lease at the configured idle boundary.
 
@@ -1094,19 +1152,13 @@ def _schedule_idle_lease_release(sid: str, session: dict) -> None:
     timer = None
 
     def release_if_still_idle() -> None:
-        lease = None
         with lock:
             if session.get("_lease_idle_timer") is not timer:
                 return
             session.pop("_lease_idle_timer", None)
             if _idle_lease_release_blocked(sid, session):
                 return
-            lease = session.pop("active_session_lease", None)
-        if lease is not None:
-            try:
-                lease.release()
-            except Exception:
-                logger.debug("Failed to release scheduled idle session lease", exc_info=True)
+            _release_idle_active_session_lease_locked(session, reason="scheduled idle")
 
     with lock:
         if session.get("active_session_lease") is None or _idle_lease_release_blocked(
@@ -1173,13 +1225,7 @@ def _release_idle_session_leases(now: float) -> None:
                     timer.cancel()
                 except Exception:
                     logger.debug("Failed to cancel swept idle lease timer", exc_info=True)
-            lease = session.pop("active_session_lease", None)
-        if lease is None:
-            continue
-        try:
-            lease.release()
-        except Exception:
-            logger.debug("Failed to release idle active session lease", exc_info=True)
+            _release_idle_active_session_lease_locked(session, reason="swept idle")
 
 
 def _reap_idle_sessions() -> None:
@@ -1212,17 +1258,15 @@ def _max_live_sessions() -> int:
         if not isinstance(gateway_cfg, dict):
             gateway_cfg = {}
 
-        # ``max_concurrent_sessions`` is the documented/public admission cap.
-        # Reuse it for detached-session LRU cleanup so admission and retention
-        # cannot drift into two unrelated limits. Keep ``max_live_sessions`` as
-        # the explicit internal override for backwards compatibility.
-        raw = cfg.get("max_live_sessions")
-        if raw is None:
+        # Warm-runtime retention is intentionally independent of active-turn
+        # admission. Only the explicit internal override enables destructive LRU
+        # teardown; max_concurrent_sessions controls leases, not open history.
+        if "max_live_sessions" in cfg:
+            raw = cfg.get("max_live_sessions")
+        elif "max_live_sessions" in gateway_cfg:
             raw = gateway_cfg.get("max_live_sessions")
-        if raw is None:
-            raw = cfg.get("max_concurrent_sessions")
-        if raw is None:
-            raw = gateway_cfg.get("max_concurrent_sessions")
+        else:
+            return 0
         coerced = coerce_max_concurrent_sessions(raw, key="max_live_sessions")
         return int(coerced) if coerced else 0
     except Exception:
@@ -1233,10 +1277,7 @@ def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     # Same hard exemptions as the TTL reaper (never evict a session mid-turn,
     # awaiting input, or still building), but WITHOUT the hours-scale age gate:
     # a detached session is eligible the moment it loses its client.
-    if session.get("running") or _session_pending_kind(sid):
-        return False
-    ready = session.get("agent_ready")
-    if ready is not None and not ready.is_set() and not session.get("lazy"):
+    if _session_has_protected_lifecycle_work(sid, session):
         return False
     return _transport_is_dead(session.get("transport"))
 
@@ -9708,6 +9749,12 @@ def _(rid, params: dict) -> dict:
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
+    # Reserve the active-turn slot before process dispatch, persistence, or an
+    # expensive agent build. The shared runner checks again defensively for
+    # internal queued/goal/notification turns that bypass this RPC handler.
+    if not _admit_turn_or_emit_limit(rid, sid, session):
+        return _ok(rid, {"status": "streaming"})
+
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
         if not isolated_response.get("error"):
@@ -10018,8 +10065,13 @@ def _notification_poller_loop(
             continue
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+            accepted = _run_prompt_submit(rid, sid, session, text)
+            if accepted is not False:
+                complete_event_delivery(evt, _claim)
+            else:
+                release_event_delivery(evt, _claim)
+                process_registry.completion_queue.put(evt)
+                time.sleep(0.25)
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -10086,8 +10138,16 @@ def _notification_poller_loop(
             continue
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+            accepted = _run_prompt_submit(rid, sid, session, text)
+            if accepted is not False:
+                complete_event_delivery(evt, _claim)
+            else:
+                release_event_delivery(evt, _claim)
+                # Shutdown cannot wait for capacity indefinitely. Preserve the
+                # unacknowledged event for a later owner/resume and stop this
+                # finite drain instead of re-consuming our own requeue forever.
+                deferred.append(evt)
+                break
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -10161,7 +10221,12 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> bool:
+    # Internal queued/goal/notification turns bypass prompt.submit. Admit them
+    # synchronously so callers can acknowledge durable work only after capacity
+    # is actually reserved.
+    if not _admit_turn_or_emit_limit(rid, sid, session):
+        return False
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -10184,19 +10249,6 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         goal_followup = None  # set by the post-turn goal hook below
         one_turn_restore = session.pop("one_turn_model_restore", None)
         try:
-            # Claim (or reuse) the cross-process active-session slot before any
-            # model work. First turn of a tab and first turn after an idle
-            # release both land here; every turn entry point (prompt.submit,
-            # queued drain, goal continuation, notification turns) funnels
-            # through this body. At cap, surface the standard limit message as
-            # this turn's error — same message.start→error shape as the
-            # ctx.blocked path below; the finally clears running/inflight so
-            # the client returns to idle.
-            limit_message = _ensure_turn_lease(sid, session)
-            if limit_message is not None:
-                _emit("error", sid, {"message": limit_message})
-                return
-
             from tools.approval import (
                 reset_current_session_key,
                 set_current_session_key,
@@ -10651,6 +10703,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # this turn can't fire during a later turn on the same agent.
             agent.interim_assistant_callback = None
             with session["history_lock"]:
+                session["_post_turn_followups_pending"] = True
                 session["running"] = False
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
@@ -10660,6 +10713,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
         if _drain_queued_prompt(rid, sid, session):
+            with session["history_lock"]:
+                session.pop("_post_turn_followups_pending", None)
             return
 
         # Chain a goal-continuation turn if the judge said so. We do
@@ -10673,6 +10728,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 if session.get("running"):
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
+                    session.pop("_post_turn_followups_pending", None)
                     return
                 session["running"] = True
             try:
@@ -10723,8 +10779,15 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
+                    accepted = _run_prompt_submit(rid, sid, session, synth)
+                    if accepted is not False:
+                        complete_event_delivery(_evt, _claim)
+                    else:
+                        release_event_delivery(_evt, _claim)
+                        process_registry.completion_queue.put(_evt)
+                        for pending_evt, _pending_synth in drained[index + 1 :]:
+                            process_registry.completion_queue.put(pending_evt)
+                        break
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
                     print(
@@ -10744,11 +10807,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # This invocation reached the end of its follow-up chain. If another
         # queued/user/goal/notification turn started meanwhile, the helper sees
         # running=True and leaves the lease to that turn.
+        with session["history_lock"]:
+            session.pop("_post_turn_followups_pending", None)
         _schedule_idle_lease_release(sid, session)
 
     run_thread = threading.Thread(target=run, daemon=True)
     session["_run_thread"] = run_thread
     run_thread.start()
+    return True
 
 
 @method("clipboard.paste")

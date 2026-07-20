@@ -112,18 +112,30 @@ def test_session_create_claims_lazily_and_first_turn_hits_the_cap(monkeypatch, t
         reset_hermes_home_override(token)
 
 
-def test_detached_session_cap_uses_public_concurrency_setting(tmp_path):
-    """The detached-session LRU must use the same public cap as admission.
-
-    Regression: session creation honored ``gateway.max_concurrent_sessions``
-    while the LRU sweeper only read the private ``max_live_sessions`` alias,
-    silently leaving detached desktop workers unlimited.
-    """
+def test_detached_session_cap_does_not_inherit_active_turn_cap(tmp_path):
+    """Active-turn admission and warm-runtime retention are separate limits."""
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text(
         "gateway:\n  max_concurrent_sessions: 3\n", encoding="utf-8"
     )
+    token = set_hermes_home_override(home)
+    try:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        assert server._max_live_sessions() == 0
+    finally:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
+def test_detached_session_cap_honors_explicit_override(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("max_live_sessions: 3\n", encoding="utf-8")
     token = set_hermes_home_override(home)
     try:
         server._cfg_cache = None
@@ -521,6 +533,49 @@ def test_isolated_prompt_submit_at_cap_skips_dispatch_and_surfaces_limit(
     finally:
         server._sessions.pop("iso-cap", None)
         blocker.release()
+
+
+def test_inline_prompt_at_cap_rejects_before_agent_build(monkeypatch):
+    ready = threading.Event()
+    ready.set()
+    session = _session(agent=types.SimpleNamespace(), agent_ready=ready)
+    server._sessions["inline-cap"] = session
+    builds = []
+    emitted = []
+    limit = "Hermes is at the active session limit (1/1). Try again when another session finishes."
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(server, "_ensure_turn_lease", lambda *_args: limit)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_args: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_args: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: builds.append(True))
+    monkeypatch.setattr(server, "_wait_agent", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload))
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "inline-cap-turn",
+                "method": "prompt.submit",
+                "params": {"session_id": "inline-cap", "text": "hello"},
+            }
+        )
+    finally:
+        server._sessions.pop("inline-cap", None)
+
+    assert response is not None
+    assert response["result"] == {"status": "streaming"}
+    assert builds == []
+    assert session["running"] is False
+    assert session.get("inflight_turn") is None
+    assert emitted[:2] == [
+        ("message.start", "inline-cap", None),
+        ("error", "inline-cap", {"message": limit}),
+    ]
 
 
 def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
@@ -9841,6 +9896,47 @@ def test_notification_poller_delivers_completion(monkeypatch):
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_requeues_capacity_rejection_without_acknowledging(monkeypatch):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server.time, "sleep", lambda *_args: None)
+
+    event = {
+        "type": "completion",
+        "session_id": "proc_capacity_retry",
+        "command": "echo hello",
+        "exit_code": 0,
+        "output": "hello",
+    }
+    process_registry._completion_consumed.discard("proc_capacity_retry")
+    isolated_queue.put(event)
+    session = _session()
+    server._sessions["sid_capacity_retry"] = session
+
+    def reject(*_args):
+        session["running"] = False
+        return False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", reject)
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_capacity_retry", session)
+        assert "proc_capacity_retry" not in process_registry._completion_consumed
+        assert isolated_queue.get_nowait() is event
+    finally:
+        server._sessions.pop("sid_capacity_retry", None)
+        process_registry._completion_consumed.discard("proc_capacity_retry")
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
 
 
 def test_notification_poller_skips_consumed(monkeypatch):

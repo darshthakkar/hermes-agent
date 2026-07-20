@@ -539,6 +539,49 @@ def test_enforce_session_cap_disabled_is_noop(server, monkeypatch):
     assert evicted == []
 
 
+@pytest.mark.parametrize("marker", ["queued_prompt", "_post_turn_followups_pending"])
+def test_detached_eviction_protects_queued_and_chained_work(server, marker):
+    ready = threading.Event()
+    ready.set()
+    session = {
+        "agent_ready": ready,
+        "created_at": 0.0,
+        "history_lock": threading.Lock(),
+        "last_active": 0.0,
+        marker: {"text": "next"} if marker == "queued_prompt" else True,
+        "session_key": "protected-work",
+        "transport": server._detached_ws_transport,
+    }
+
+    assert server._ws_session_is_orphaned(session) is False
+    assert server._session_is_lru_evictable("protected", session) is False
+    assert server._session_is_evictable("protected", session, server._SESSION_TTL_S + 1) is False
+
+
+def test_detached_eviction_preserves_explicit_background_process(server, monkeypatch):
+    from tools.process_registry import process_registry
+
+    ready = threading.Event()
+    ready.set()
+    session = {
+        "agent_ready": ready,
+        "created_at": 0.0,
+        "history_lock": threading.Lock(),
+        "last_active": 0.0,
+        "session_key": "background-owner",
+        "transport": server._detached_ws_transport,
+    }
+    monkeypatch.setattr(
+        process_registry,
+        "has_active_for_session",
+        lambda key, max_active_age=None: key == "background-owner",
+    )
+
+    assert server._ws_session_is_orphaned(session) is False
+    assert server._session_is_lru_evictable("background", session) is False
+    assert server._session_is_evictable("background", session, server._SESSION_TTL_S + 1) is False
+
+
 def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
     """A user message persisted with list-shaped multimodal content used to
     crash session resume with ``'list' object has no attribute 'strip'``."""
@@ -1347,6 +1390,51 @@ def test_turn_start_invalidates_older_idle_lease_timer(server, monkeypatch):
     timer.fire()
     assert lease.release_count == 0
     assert session.get("active_session_lease") is lease
+
+
+def test_turn_start_waits_for_atomic_idle_registry_release(server, monkeypatch):
+    _FakeLeaseTimer.created = []
+    monkeypatch.setattr(server, "_LeaseTimer", _FakeLeaseTimer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"tui_lease_idle_seconds": 7})
+    release_entered = threading.Event()
+    allow_release = threading.Event()
+    release_done = threading.Event()
+
+    class BlockingLease:
+        def release(self):
+            release_entered.set()
+            assert allow_release.wait(timeout=2)
+            release_done.set()
+
+    replacement = _CountingLease()
+
+    def claim(*_args, **_kwargs):
+        if not release_done.is_set():
+            return None, "old registry lease still occupies the only slot"
+        return replacement, None
+
+    monkeypatch.setattr(server, "_claim_active_session_slot", claim)
+    session = _lease_test_session(active_session_lease=BlockingLease())
+    server._schedule_idle_lease_release("ui-race", session)
+    timer = _FakeLeaseTimer.created[-1]
+
+    release_thread = threading.Thread(target=timer.fire)
+    release_thread.start()
+    assert release_entered.wait(timeout=2)
+
+    result = {}
+    turn_thread = threading.Thread(
+        target=lambda: result.setdefault("limit", server._ensure_turn_lease("ui-race", session))
+    )
+    turn_thread.start()
+    turn_thread.join(timeout=0.05)
+    assert turn_thread.is_alive(), "turn admission raced ahead of registry release"
+
+    allow_release.set()
+    release_thread.join(timeout=2)
+    turn_thread.join(timeout=2)
+    assert result["limit"] is None
+    assert session["active_session_lease"] is replacement
 
 
 def test_active_slot_release_cancels_idle_lease_timer(server, monkeypatch):
