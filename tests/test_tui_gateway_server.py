@@ -376,6 +376,153 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     assert session.get("_compute_host_active") is not True
 
 
+def test_isolated_prompt_submit_claims_turn_lease_before_dispatch(monkeypatch, tmp_path):
+    """Process-isolated turns bypass _run_prompt_submit, so the compute-host
+    path must claim (or reuse) the same lazy active-session lease inline turns
+    do — otherwise isolated active turns never count against
+    max_concurrent_sessions."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    session = _session(agent_ready=threading.Event())
+    session["agent"] = None
+    server._sessions["iso-lease"] = session
+
+    class FakeSupervisor:
+        def __init__(self):
+            self.frames = []
+            self.lease_at_dispatch = []
+            self.callback = None
+
+        def submit_turn(self, frame, *, on_complete=None):
+            self.frames.append(frame)
+            self.lease_at_dispatch.append(session.get("active_session_lease"))
+            self.callback = on_complete
+            return frame["request_id"]
+
+    fake = FakeSupervisor()
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"max_concurrent_sessions": 1, "dashboard": {"turn_isolation": True}},
+    )
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: fake)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "iso-turn-1",
+                "method": "prompt.submit",
+                "params": {"session_id": "iso-lease", "text": "hello"},
+            }
+        )
+        assert resp["result"] == {"status": "streaming", "turn_isolation": True}
+        lease = session.get("active_session_lease")
+        assert lease is not None
+        # Claimed BEFORE the compute-host dispatch, not after.
+        assert fake.lease_at_dispatch == [lease]
+        assert [e["session_id"] for e in active_session_registry_snapshot()] == [
+            "session-key"
+        ]
+
+        fake.callback(
+            {
+                "type": "turn.end",
+                "sid": "iso-lease",
+                "request_id": "iso-turn-1",
+                "history_version": 1,
+            }
+        )
+        assert session["running"] is False
+
+        # A second turn reuses the held lease — no duplicate registry claim.
+        resp = server.handle_request(
+            {
+                "id": "iso-turn-2",
+                "method": "prompt.submit",
+                "params": {"session_id": "iso-lease", "text": "again"},
+            }
+        )
+        assert resp["result"] == {"status": "streaming", "turn_isolation": True}
+        assert session.get("active_session_lease") is lease
+        assert fake.lease_at_dispatch == [lease, lease]
+        assert len(active_session_registry_snapshot()) == 1
+    finally:
+        server._release_active_session_slot(session)
+        server._sessions.pop("iso-lease", None)
+
+
+def test_isolated_prompt_submit_at_cap_skips_dispatch_and_surfaces_limit(
+    monkeypatch, tmp_path
+):
+    """When another surface owns the only max_concurrent_sessions slot, an
+    isolated turn must not reach the compute host: the session returns to
+    idle (running cleared, inflight cleared, no lease) and the standard
+    limit message is surfaced as the turn's error event — the same shape the
+    inline lease check in _run_prompt_submit uses."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    blocker, message = try_acquire_active_session(
+        session_id="other-surface",
+        surface="cli",
+        config={"max_concurrent_sessions": 1},
+    )
+    assert message is None
+    assert blocker is not None
+
+    session = _session(agent_ready=threading.Event())
+    session["agent"] = None
+    server._sessions["iso-cap"] = session
+    frames = []
+
+    class FakeSupervisor:
+        def submit_turn(self, frame, *, on_complete=None):
+            frames.append(frame)
+            return frame["request_id"]
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"max_concurrent_sessions": 1, "dashboard": {"turn_isolation": True}},
+    )
+    monkeypatch.setattr(
+        server, "_get_compute_host_supervisor", lambda _cfg=None: FakeSupervisor()
+    )
+    emitted = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload))
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "iso-cap-turn",
+                "method": "prompt.submit",
+                "params": {"session_id": "iso-cap", "text": "hello"},
+            }
+        )
+        assert "result" in resp
+        assert frames == []
+        assert session["running"] is False
+        assert session.get("inflight_turn") is None
+        assert session.get("active_session_lease") is None
+        assert emitted == [
+            ("message.start", "iso-cap", None),
+            (
+                "error",
+                "iso-cap",
+                {
+                    "message": (
+                        "Hermes is at the active session limit (1/1). "
+                        "Try again when another session finishes."
+                    )
+                },
+            ),
+        ]
+    finally:
+        server._sessions.pop("iso-cap", None)
+        blocker.release()
+
+
 def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
     session = _session(
         agent=None,
