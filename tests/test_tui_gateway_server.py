@@ -2492,6 +2492,44 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     assert not thread.is_alive()
 
 
+def test_ws_orphan_reap_retries_after_detached_turn_finishes(monkeypatch):
+    callbacks = []
+    closed = []
+
+    class _FakeTimer:
+        def __init__(self, _delay, callback):
+            self.callback = callback
+
+        def start(self):
+            callbacks.append(self.callback)
+
+    class _FakeWorker:
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(server.threading, "Timer", _FakeTimer)
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+
+    server._sessions["sid"] = _session(
+        transport=server._detached_ws_transport,
+        running=True,
+        slash_worker=_FakeWorker(),
+    )
+    try:
+        server._schedule_ws_orphan_reap("sid")
+        callbacks.pop(0)()  # Grace expires while the turn is still running.
+        assert "sid" in server._sessions
+
+        server._sessions["sid"]["running"] = False
+        callbacks.pop(0)()  # The reaper must have rescheduled itself.
+        assert "sid" not in server._sessions
+        assert closed == [True]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_finalize_session_closes_slash_worker(monkeypatch):
     """_finalize_session closes the slash_worker subprocess itself.
 

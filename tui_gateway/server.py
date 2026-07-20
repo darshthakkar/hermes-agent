@@ -849,9 +849,23 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         # guard with _sessions_lock). _sessions_lock is an RLock and the global
         # ordering is always resume_lock -> sessions_lock, so nesting is safe.
         with _session_resume_lock:
-            if not _ws_session_is_orphaned(_sessions.get(sid)):
+            session = _sessions.get(sid)
+            if _ws_session_is_orphaned(session):
+                session = _pop_session_by_id(sid)
+            else:
+                # A disconnect can happen during a long-running turn. If the
+                # grace timer fires before that turn finishes, the session is
+                # still detached but intentionally not orphan-eligible yet.
+                # Retry rather than dropping the only cleanup attempt; a later
+                # reconnect changes the transport and stops the retry chain.
+                if (
+                    session
+                    and not session.get("_finalized")
+                    and session.get("running")
+                    and session.get("transport") is _detached_ws_transport
+                ):
+                    _schedule_ws_orphan_reap(sid)
                 return
-            session = _pop_session_by_id(sid)
         _teardown_popped_session(session, end_reason="ws_orphan_reap")
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
