@@ -81,6 +81,31 @@ def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
         reset_hermes_home_override(token)
 
 
+def test_detached_session_cap_uses_public_concurrency_setting(tmp_path):
+    """The detached-session LRU must use the same public cap as admission.
+
+    Regression: session creation honored ``gateway.max_concurrent_sessions``
+    while the LRU sweeper only read the private ``max_live_sessions`` alias,
+    silently leaving detached desktop workers unlimited.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "gateway:\n  max_concurrent_sessions: 3\n", encoding="utf-8"
+    )
+    token = set_hermes_home_override(home)
+    try:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        assert server._max_live_sessions() == 3
+    finally:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
 def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     """Desktop/TUI sessions must pin the agent cwd per session.
 

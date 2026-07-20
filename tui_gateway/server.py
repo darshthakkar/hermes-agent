@@ -961,11 +961,21 @@ def _max_live_sessions() -> int:
         from hermes_cli.active_sessions import coerce_max_concurrent_sessions
 
         cfg = _load_cfg() or {}
+        gateway_cfg = cfg.get("gateway")
+        if not isinstance(gateway_cfg, dict):
+            gateway_cfg = {}
+
+        # ``max_concurrent_sessions`` is the documented/public admission cap.
+        # Reuse it for detached-session LRU cleanup so admission and retention
+        # cannot drift into two unrelated limits. Keep ``max_live_sessions`` as
+        # the explicit internal override for backwards compatibility.
         raw = cfg.get("max_live_sessions")
         if raw is None:
-            gateway_cfg = cfg.get("gateway")
-            if isinstance(gateway_cfg, dict):
-                raw = gateway_cfg.get("max_live_sessions")
+            raw = gateway_cfg.get("max_live_sessions")
+        if raw is None:
+            raw = cfg.get("max_concurrent_sessions")
+        if raw is None:
+            raw = gateway_cfg.get("max_concurrent_sessions")
         coerced = coerce_max_concurrent_sessions(raw, key="max_live_sessions")
         return int(coerced) if coerced else 0
     except Exception:
